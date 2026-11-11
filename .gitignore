@@ -1,0 +1,11 @@
+# artefatos grandes ou regeneraveis dos testes
+codes/resultados/**/stream.json
+codes/resultados/**/console_*.txt
+*.log
+# geracao do relatorio
+relatorio/out/
+relatorio/fig/*.html
+node_modules/
+
+# material do professor (nao redistribuir sem autorizacao)
+PROF. ANDRE TEMA APS*.pdf

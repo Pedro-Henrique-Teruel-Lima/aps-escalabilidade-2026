@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" font-family="Arial, Helvetica, sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#222"/></marker></defs>
+<rect width="900" height="460" fill="#fff"/>
+<g stroke="#222" stroke-width="1.6" fill="#fff">
+<rect x="15" y="190" width="105" height="70" rx="6" fill="#eee"/>
+<rect x="175" y="165" width="150" height="120" rx="6" fill="#d9d9d9"/>
+<rect x="400" y="30" width="150" height="80" rx="6"/>
+<rect x="590" y="30" width="110" height="80" rx="6" fill="#eee"/>
+<rect x="745" y="30" width="140" height="80" rx="6"/>
+<rect x="745" y="190" width="140" height="80" rx="6" fill="#d9d9d9"/>
+<rect x="400" y="350" width="150" height="80" rx="6"/>
+<rect x="745" y="350" width="140" height="80" rx="6" fill="#d9d9d9"/>
+</g>
+<g stroke="#222" stroke-width="1.6" fill="none" marker-end="url(#a)">
+<path d="M120 225 L175 225"/>
+<path d="M325 195 L400 80"/>
+<path d="M550 70 L590 70"/>
+<path d="M700 70 L745 70"/>
+<path d="M815 110 L815 190"/>
+<path d="M325 255 L400 380"/>
+<path d="M550 390 L745 390"/>
+</g>
+<path d="M815 270 L815 350" stroke="#222" stroke-width="1.6" stroke-dasharray="6 4" fill="none" marker-end="url(#a)"/>
+<g font-size="14" text-anchor="middle" fill="#111">
+<text x="67" y="220" font-weight="bold">k6 /</text><text x="67" y="238">hubs</text>
+<text x="250" y="212" font-weight="bold">HAProxy</text><text x="250" y="232">porta 8080</text><text x="250" y="250">alias aps-app</text><text x="250" y="268">0,08 vCPU</text>
+<text x="475" y="58" font-weight="bold">ingest × 3</text><text x="475" y="78">valida, hash, Humidex</text><text x="475" y="96">0,05 vCPU cada</text>
+<text x="645" y="58" font-weight="bold">Redis</text><text x="645" y="78">fila (AOF)</text><text x="645" y="96">0,05 vCPU</text>
+<text x="815" y="58" font-weight="bold">worker</text><text x="815" y="78">grava em lote</text><text x="815" y="96">0,05 vCPU</text>
+<text x="815" y="218" font-weight="bold">PostgreSQL mestre</text><text x="815" y="238">escrita</text><text x="815" y="256">0,20 vCPU</text>
+<text x="475" y="378" font-weight="bold">leitura × 2</text><text x="475" y="398">main.go original</text><text x="475" y="416">0,05 vCPU cada</text>
+<text x="815" y="378" font-weight="bold">PostgreSQL réplica</text><text x="815" y="398">somente leitura</text><text x="815" y="416">0,15 vCPU</text>
+</g>
+<g font-size="12" fill="#333">
+<text x="270" y="140" text-anchor="end">POST /telemetria</text>
+<text x="270" y="355" text-anchor="end">GET /indice-calor, /audit/*</text>
+<text x="570" y="62" text-anchor="middle">LPUSH</text>
+<text x="723" y="62" text-anchor="middle">BRPOP</text>
+<text x="822" y="155">INSERT em lote</text>
+<text x="822" y="312">replicação por streaming (WAL)</text>
+<text x="645" y="382" text-anchor="middle">SELECT</text>
+</g>
+</svg>

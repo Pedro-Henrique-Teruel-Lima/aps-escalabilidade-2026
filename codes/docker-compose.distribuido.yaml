@@ -1,0 +1,516 @@
+# docker-compose.distribuido.yaml — CENARIO B (arquitetura distribuida)
+#
+# Topologia (tudo atras da porta 8080, contrato HTTP inalterado):
+#
+#   k6 --> haproxy:8080 (alias aps-app)
+#            |-- POST /telemetria ------> ingest x5 --LPUSH--> redis --BRPOP--> worker --> postgres
+#            |-- GET  /indice-calor, /audit/*, /health ---> leitura x2 (main.go original) --> postgres-replica
+#
+#   postgres (MASTER, escrita) --replicacao em streaming--> postgres-replica (SLAVE, somente leitura)
+#
+# Ideia: o cliente HTTP e isolado na borda. A rota de escrita valida, calcula
+# hash e Humidex (CPU real, nada e simulado), enfileira no Redis e responde 202.
+# Um worker consome a fila e grava em LOTE (1 INSERT com unnest para varias
+# requisicoes), eliminando o gargalo do pool/commit por requisicao. As leituras
+# ficam em instancias separadas, usando o main.go original sem alteracao.
+#
+# ORCAMENTO DE CPU (limits.cpus, instancias contadas individualmente):
+#   haproxy          1 x 0.08 = 0.08
+#   redis            1 x 0.05 = 0.05
+#   postgres master  1 x 0.20 = 0.20
+#   postgres replica 1 x 0.15 = 0.15
+#   worker           1 x 0.05 = 0.05
+#   ingest           3 x 0.05 = 0.15
+#   leitura          2 x 0.05 = 0.10
+#   db-init          1 x 0.01 = 0.01  (roda uma vez e encerra)
+#   TOTAL                       0.79  (teto: 0.80)
+#
+# Regras: toda instancia da aplicacao (ingest, worker, leitura) usa
+# exatamente cpus: '0.05'; porta publicada 8080; alias aps-app em aps-net;
+# nenhum volume external. O codigo Go extra vive inline (dockerfile_inline).
+
+x-edge-build: &edge-build
+  context: .
+  dockerfile_inline: |
+    # syntax=docker/dockerfile:1
+    FROM golang:1.25-alpine AS builder
+    WORKDIR /src
+    COPY <<'EOF' /src/main.go
+    package main
+
+    // edge: modo "ingest" (HTTP -> fila Redis) e modo "worker" (fila -> Postgres).
+
+    import (
+    	"context"
+    	"crypto/sha256"
+    	"encoding/hex"
+    	"encoding/json"
+    	"fmt"
+    	"log"
+    	"math"
+    	"net/http"
+    	"os"
+    	"strconv"
+    	"time"
+
+    	"github.com/jackc/pgx/v5/pgxpool"
+    	"github.com/redis/go-redis/v9"
+    )
+
+    const queueKey = "aps:ingest"
+
+    type input struct {
+    	SensorID  string `json:"sensor_id"`
+    	Timestamp string `json:"timestamp"`
+    	Metrics   struct {
+    		Microclimate struct {
+    			Temp float64 `json:"temperature_celsius"`
+    			Hum  float64 `json:"relative_humidity_percentage"`
+    		} `json:"microclimate"`
+    	} `json:"metrics"`
+    	Raw string `json:"raw_telemetry_packet"`
+    }
+
+    type batchInput struct {
+    	Measurements []input `json:"measurements"`
+    }
+
+    // rec e a mensagem da fila: ja carrega hash e Humidex calculados na borda.
+    type rec struct {
+    	S string  `json:"s"`
+    	T string  `json:"t"`
+    	R string  `json:"r"`
+    	H string  `json:"h"`
+    	X float64 `json:"x"`
+    }
+
+    func envInt(k string, d int) int {
+    	if v, err := strconv.Atoi(os.Getenv(k)); err == nil && v > 0 {
+    		return v
+    	}
+    	return d
+    }
+
+    func parseTS(s string) (time.Time, error) {
+    	for _, l := range []string{"2006-01-02T15:04:05.000000Z", time.RFC3339Nano, time.RFC3339} {
+    		if t, err := time.Parse(l, s); err == nil {
+    			return t.UTC(), nil
+    		}
+    	}
+    	return time.Time{}, fmt.Errorf("timestamp invalido")
+    }
+
+    func canonical(t time.Time) string {
+    	return t.UTC().Format("2006-01-02T15:04:05.000000") + "Z"
+    }
+
+    func humidex(t, h float64) float64 {
+    	e := 6.112 * math.Exp((17.67*t)/(t+243.5)) * (h / 100.0)
+    	return math.Round((t+0.5555*(e-10.0))*100) / 100
+    }
+
+    func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+    	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    	w.WriteHeader(code)
+    	json.NewEncoder(w).Encode(v)
+    }
+
+    func newRedis() *redis.Client {
+    	return redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR"), PoolSize: 20})
+    }
+
+    // ---------------- modo ingest ----------------
+
+    func runIngest() {
+    	rdb := newRedis()
+    	mux := http.NewServeMux()
+    	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+    		ctx, c := context.WithTimeout(r.Context(), 2*time.Second)
+    		defer c()
+    		if rdb.Ping(ctx).Err() != nil {
+    			writeJSON(w, 503, map[string]string{"status": "fila indisponivel"})
+    			return
+    		}
+    		writeJSON(w, 200, map[string]string{"status": "pronto"})
+    	})
+    	mux.HandleFunc("POST /telemetria", func(w http.ResponseWriter, r *http.Request) {
+    		var b batchInput
+    		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+    			writeJSON(w, 400, map[string]string{"erro": "corpo JSON invalido"})
+    			return
+    		}
+    		if len(b.Measurements) == 0 {
+    			writeJSON(w, 400, map[string]string{"erro": "lote vazio"})
+    			return
+    		}
+    		recs := make([]rec, 0, len(b.Measurements))
+    		rejected := 0
+    		for _, m := range b.Measurements {
+    			ts, err := parseTS(m.Timestamp)
+    			if err != nil || m.SensorID == "" || m.Raw == "" {
+    				rejected++
+    				continue
+    			}
+    			c := canonical(ts)
+    			sum := sha256.Sum256([]byte(m.SensorID + c + m.Raw))
+    			recs = append(recs, rec{S: m.SensorID, T: c, R: m.Raw,
+    				H: hex.EncodeToString(sum[:]),
+    				X: humidex(m.Metrics.Microclimate.Temp, m.Metrics.Microclimate.Hum)})
+    		}
+    		if len(recs) > 0 {
+    			payload, _ := json.Marshal(recs)
+    			ctx, c := context.WithTimeout(r.Context(), 3*time.Second)
+    			defer c()
+    			if err := rdb.LPush(ctx, queueKey, payload).Err(); err != nil {
+    				writeJSON(w, 503, map[string]string{"erro": "fila indisponivel"})
+    				return
+    			}
+    		}
+    		// total_persistido = medicoes aceitas e enfileiradas (persistencia assincrona).
+    		writeJSON(w, 202, map[string]int{
+    			"total_recebido":   len(b.Measurements),
+    			"total_persistido": len(recs),
+    			"total_rejeitado":  rejected,
+    			"total_duplicado":  0,
+    		})
+    	})
+    	log.Println("ingest ouvindo em :8080")
+    	log.Fatal((&http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}).ListenAndServe())
+    }
+
+    // ---------------- modo worker ----------------
+
+    func flush(ctx context.Context, pool *pgxpool.Pool, all []rec) error {
+    	n := len(all)
+    	ss, ts, rs, hs := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
+    	last := map[string]float64{}
+    	for i, r := range all {
+    		ss[i], ts[i], rs[i], hs[i] = r.S, r.T, r.R, r.H
+    		last[r.S] = r.X
+    	}
+    	is, ix := make([]string, 0, len(last)), make([]float64, 0, len(last))
+    	for s, x := range last {
+    		is, ix = append(is, s), append(ix, x)
+    	}
+    	tx, err := pool.Begin(ctx)
+    	if err != nil {
+    		return err
+    	}
+    	defer tx.Rollback(ctx)
+    	if _, err := tx.Exec(ctx, `INSERT INTO medicoes (sensor_id, timestamp, raw_packet, hash, criado_em)
+    		SELECT s, t::timestamptz, r, h, now()
+    		FROM unnest($$1::text[], $$2::text[], $$3::text[], $$4::text[]) AS u(s, t, r, h)
+    		ON CONFLICT (sensor_id, timestamp) DO NOTHING`, ss, ts, rs, hs); err != nil {
+    		return err
+    	}
+    	if _, err := tx.Exec(ctx, `INSERT INTO indices_calor (sensor_id, indice, atualizado_em)
+    		SELECT s, x, now() FROM unnest($$1::text[], $$2::float8[]) AS u(s, x)
+    		ON CONFLICT (sensor_id) DO UPDATE SET indice = EXCLUDED.indice, atualizado_em = now()`, is, ix); err != nil {
+    		return err
+    	}
+    	return tx.Commit(ctx)
+    }
+
+    func runWorker() {
+    	rdb := newRedis()
+    	cfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+    	if err != nil {
+    		log.Fatal(err)
+    	}
+    	cfg.MaxConns = 2
+    	ctx := context.Background()
+    	var pool *pgxpool.Pool
+    	for {
+    		if pool, err = pgxpool.NewWithConfig(ctx, cfg); err == nil && pool.Ping(ctx) == nil {
+    			break
+    		}
+    		log.Println("aguardando banco:", err)
+    		time.Sleep(time.Second)
+    	}
+    	maxMsgs := envInt("WORKER_MAX_MSGS", 100)
+    	log.Println("worker consumindo", queueKey)
+    	for {
+    		first, err := rdb.BRPop(ctx, 2*time.Second, queueKey).Result()
+    		if err == redis.Nil {
+    			continue
+    		}
+    		if err != nil {
+    			log.Println("redis:", err)
+    			time.Sleep(time.Second)
+    			continue
+    		}
+    		msgs := []string{first[1]}
+    		if more, err := rdb.RPopCount(ctx, queueKey, maxMsgs-1).Result(); err == nil {
+    			msgs = append(msgs, more...)
+    		}
+    		var all []rec
+    		for _, m := range msgs {
+    			var rs []rec
+    			if json.Unmarshal([]byte(m), &rs) == nil {
+    				all = append(all, rs...)
+    			}
+    		}
+    		// Retenta ate gravar: a medicao ja saiu da fila, nao pode ser perdida.
+    		for {
+    			if err := flush(ctx, pool, all); err == nil {
+    				break
+    			} else {
+    				log.Println("falha ao gravar lote, retentando:", err)
+    				time.Sleep(time.Second)
+    			}
+    		}
+    	}
+    }
+
+    func main() {
+    	if os.Getenv("MODE") == "worker" {
+    		runWorker()
+    		return
+    	}
+    	runIngest()
+    }
+    EOF
+    RUN go mod init aps/edge \
+     && go get github.com/jackc/pgx/v5@v5.7.2 github.com/redis/go-redis/v9@v9.7.0 \
+     && go mod tidy \
+     && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/edge main.go
+    FROM alpine:3.20
+    RUN apk add --no-cache ca-certificates
+    COPY --from=builder /out/edge /usr/local/bin/edge
+    EXPOSE 8080
+    ENTRYPOINT ["/usr/local/bin/edge"]
+
+configs:
+  haproxy_cfg:
+    content: |
+      global
+        maxconn 8192
+      defaults
+        mode http
+        timeout connect 3s
+        timeout client 30s
+        timeout server 30s
+        timeout queue 20s
+        option redispatch
+        retries 2
+      resolvers docker
+        nameserver dns 127.0.0.11:53
+        hold valid 2s
+        accepted_payload_size 8192
+      frontend fe
+        bind *:8080
+        acl is_ingest path_beg /telemetria
+        use_backend ingest if is_ingest
+        default_backend leitura
+      backend ingest
+        balance leastconn
+        option httpchk GET /health
+        default-server check inter 5s fall 3 rise 1 resolvers docker init-addr none maxconn 100
+        server-template i 3 ingest:8080
+      backend leitura
+        balance leastconn
+        option httpchk GET /health
+        default-server check inter 10s fall 3 rise 1 resolvers docker init-addr none maxconn 50
+        server-template l 2 leitura:8080
+
+  pg_repl_init:
+    content: |
+      #!/bin/sh
+      # libera conexoes de replicacao (o pg_hba padrao da imagem nao cobre "replication")
+      echo "host replication all all scram-sha-256" >> "$$PGDATA/pg_hba.conf"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - synchronous_commit=off
+      - -c
+      - max_connections=50
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=5
+    environment:
+      - POSTGRES_USER=iot
+      - POSTGRES_PASSWORD=iot
+      - POSTGRES_DB=telemetria
+    configs:
+      - source: pg_repl_init
+        target: /docker-entrypoint-initdb.d/10-replicacao.sh
+        mode: 0755
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d telemetria"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  postgres-replica:
+    image: postgres:16-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        export PGPASSWORD=iot
+        D=/var/lib/postgresql/data
+        if [ ! -s $$D/PG_VERSION ]; then
+          until su-exec postgres pg_basebackup -h postgres -U iot -D $$D -R -X stream; do
+            echo "aguardando master para pg_basebackup..."; sleep 2
+          done
+          chmod 700 $$D
+        fi
+        exec su-exec postgres postgres -c hot_standby=on -c max_connections=50 -c shared_buffers=64MB
+    deploy:
+      resources:
+        limits:
+          cpus: '0.15'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d telemetria"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  db-init:
+    image: postgres:16-alpine
+    environment:
+      - PGPASSWORD=iot
+    volumes:
+      - ./init.sql:/init.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          psql -h postgres -U iot -d telemetria -f /init.sql && exit 0
+          sleep 1
+        done
+        echo "Falha ao aplicar init.sql" && exit 1
+    deploy:
+      resources:
+        limits:
+          cpus: '0.01'
+          memory: 64M
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "100mb", "--maxmemory-policy", "noeviction"]
+    deploy:
+      resources:
+        limits:
+          cpus: '0.05'
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  ingest:
+    build: *edge-build
+    image: aps-edge:distribuido
+    environment:
+      - MODE=ingest
+      - REDIS_ADDR=redis:6379
+      - GOMAXPROCS=2
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '0.05'
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: *edge-build
+    image: aps-edge:distribuido
+    environment:
+      - MODE=worker
+      - REDIS_ADDR=redis:6379
+      - DATABASE_URL=postgres://iot:iot@postgres:5432/telemetria?sslmode=disable
+      - GOMAXPROCS=2
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.05'
+          memory: 64M
+    depends_on:
+      redis:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+  leitura:
+    build:
+      context: .
+      dockerfile: Dockerfile.monolito
+    environment:
+      - DATABASE_URL=postgres://iot:iot@postgres-replica:5432/telemetria?sslmode=disable
+      - GOMAXPROCS=2
+      - DB_MAX_CONNS=4
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.05'
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      postgres-replica:
+        condition: service_healthy
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    configs:
+      - source: haproxy_cfg
+        target: /usr/local/etc/haproxy/haproxy.cfg
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.08'
+          memory: 64M
+    networks:
+      default:
+      aps-net:
+        aliases: [aps-app]
+    depends_on:
+      ingest:
+        condition: service_healthy
+      leitura:
+        condition: service_healthy
+
+networks:
+  aps-net:
+    external: true
